@@ -1,0 +1,21 @@
+# tactile_detect — training dependencies
+#
+# GPU เป้าหมาย: NVIDIA RTX 5060 Ti (Blackwell, sm_120)
+#   -> ต้องใช้ PyTorch build กับ CUDA 12.8 (cu128) ขึ้นไป + NVIDIA driver >= 570
+#   -> wheel เก่า (cu121/cu124) จะรันไม่ได้บนการ์ด 50-series
+#
+# ติดตั้ง:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# (แก้เลขเวอร์ชัน torch/torchvision ขึ้นได้ ขอแค่ +cu128 และให้คู่กันถูกต้อง)
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+
+ultralytics>=8.3.0
+
+# --- ออปชัน: แปลง ONNX -> OpenVINO/.blob เองในเครื่อง (ไม่จำเป็นถ้าใช้ tools.luxonis.com) ---
+# blobconverter
+# onnxsim
