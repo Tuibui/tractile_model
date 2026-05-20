@@ -69,3 +69,4 @@ tactile_detect/
 - ใส่ภาพ negative (มีของเหลืองหลอกแต่ไม่มี tactile) เพื่อลด false positive
 - คุมความหลากหลายของแสง/พื้น/สถานที่ ให้ครบ
 # tractile_model
+# tractile_model
