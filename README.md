@@ -1,12 +1,14 @@
 # tactile_detect — เทรน YOLO ตรวจจับ tactile paving สำหรับ OAK-D-Lite
 
-ตรวจจับ tactile paving 2 ชนิด แล้วรันบน OAK-D-Lite (RVC2) ด้วย `YoloSpatialDetectionNetwork`
-เพื่อได้ระยะ (เมตร) จาก depth บนตัวกล้อง:
+ตรวจจับ tactile paving แล้วรันบน OAK-D-Lite (RVC2) ด้วย `YoloSpatialDetectionNetwork`
+เพื่อได้ระยะ (เมตร) จาก depth บนตัวกล้อง
 
-- `bar_tile`  — กระเบื้องเส้นยาว = ทางตรง
-- `dot_tile`  — กระเบื้องจุดกลม = จุดเลี้ยว/แยก/ระวัง
+ชุดข้อมูลปัจจุบันจาก CiRA CORE มี **คลาสเดียว**:
+- `tactile`  — กระเบื้อง tactile paving (ทุกกล่องใน label เป็น class id เดียว)
 
-> หมายเหตุ: ชนิดและ "ลำดับ" ของคลาสต้องตรงกับที่ตั้งไว้ใน CiRA CORE
+> หมายเหตุ: CiRA CORE มักเก็บ class id เป็น "เลข global ของโปรเจกต์" (ในชุดนี้คือ `451`)
+> ไม่ใช่ 0-based ที่ Ultralytics ต้องการ — `import_ciracore.py` จะ **รีแมปให้เป็น 0..nc-1 ให้อัตโนมัติ**
+> (เช่น `451 -> 0`) ถ้าภายหลังเพิ่มคลาส (เช่น `bar_tile` / `dot_tile`) ให้ใส่ชื่อตามลำดับ id ที่ใช้จริง
 
 ---
 
@@ -29,10 +31,13 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 ### 3) แปลงเป็น dataset + แบ่ง train/val
 ```bash
-python scripts/import_ciracore.py --src raw_ciracore --out dataset --val 0.2
+python scripts/import_ciracore.py --src raw_ciracore --out dataset --val 0.2 --names tactile
+# ถ้ามีหลายคลาส ใส่ชื่อตามลำดับ id ที่ใช้จริง (น้อย->มาก): --names bar_tile dot_tile
 ```
 สร้าง `dataset/images/{train,val}`, `dataset/labels/{train,val}` และ `data.yaml` ให้อัตโนมัติ
-(รูปที่ไม่มีกล่อง = negative จะถูกเก็บไว้เทรนด้วย — ช่วยลด false positive จากของสีเหลืองหลอก)
+- สแกน label หา class id ที่ใช้จริง แล้ว **รีแมปเป็น 0-based** (เช่น `451 -> 0`) + เขียน label ใหม่
+- รูปที่ไม่มีกล่อง = negative จะถูกเก็บไว้เทรนด้วย — ช่วยลด false positive จากของสีเหลืองหลอก
+- ถ้าไม่ใส่ `--names` จะตั้งชื่อชั่วคราว `class0...` ให้ (แก้ใน `data.yaml` ก่อนเทรนได้)
 
 ### 4) เทรน
 ```bash

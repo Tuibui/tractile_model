@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""เทรน YOLO detection สำหรับ tactile paving (bar_tile / dot_tile) เพื่อรันบน OAK-D-Lite (RVC2)
+"""เทรน YOLO detection สำหรับ tactile paving เพื่อรันบน OAK-D-Lite (RVC2)
+
+จำนวนคลาสมาจาก data.yaml อัตโนมัติ (ตอนนี้คลาสเดียว: tactile)
 
 ตัวอย่าง:
   python train.py                         # ค่าเริ่มต้น (yolo11n, imgsz 416)

@@ -1,8 +1,22 @@
+# virtualenvs (training venv + scripts/venv) — never commit
 .venv/
-raw_ciracore/
+venv/
+
+# generated / regenerated on the training PC (don't commit)
 dataset/
+data.yaml
 runs/
+
+# local junk
+.cache/
+collll.txt
+
+# big media / model artifacts
+recordings/
+*.mp4
 *.onnx
 *.blob
 *.pt
-data.yaml
+
+# NOTE: raw_ciracore/ is intentionally committed — it's the 12MB source data
+# the training PC needs to run import_ciracore.py + train.py

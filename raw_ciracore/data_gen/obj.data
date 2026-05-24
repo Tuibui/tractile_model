@@ -1,0 +1,5 @@
+classes = 2
+train  = data_gen/train_darknet.txt
+valid  = data_gen/train_darknet.txt
+names = data_gen/obj.names
+backup = data_gen/backup/
