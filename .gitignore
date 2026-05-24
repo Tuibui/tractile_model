@@ -7,6 +7,11 @@ dataset/
 data.yaml
 runs/
 
+# OAK recording helpers — not needed on the training PC
+record.sh
+scripts/record_oak.py
+scripts/recordings/
+
 # local junk
 .cache/
 collll.txt
