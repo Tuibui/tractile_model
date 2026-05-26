@@ -16,9 +16,9 @@ scripts/record_oak.py
 .cache/
 collll.txt
 
-
-
+# big media / model artifacts
 recordings/
+
 *.onnx
 *.blob
 *.pt
