@@ -10,7 +10,7 @@ runs/
 # OAK recording helpers — not needed on the training PC
 record.sh
 scripts/record_oak.py
-
+scripts/venv/
 
 # local junk
 .cache/
