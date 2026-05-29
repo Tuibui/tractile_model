@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
-"""ตรวจจับ "ทางเดิน tactile สีเหลือง" ด้วย logic สี + รูปทรง + ตำแหน่งพื้น (ไม่ใช้ deep learning)
 
-ตรรกะ (ตรวจสด ๆ ทีละเฟรม ไม่มี state):
-  1. mask สีเหลือง (HSV) เฉพาะแถบล่าง bottom ของภาพ
-  2. หา region ที่ "เหมือนทางบนพื้น" ที่สุด (อยู่บนพื้น + เรียวสูง + อยู่กลางภาพแถวเท้าเรา)
-  3. ลากเส้นกึ่งกลาง (centerline) -> บอกทิศ ตรง/เลี้ยวซ้าย/เลี้ยวขวา + reach (%)
-
-คืน 2 ภาพ: (ภาพปกติ+overlay, mask สีเหลือง)
-
-ตัวอย่าง:
-  python scripts/color_path_detect.py                                          # ดูสด data_3 (ค่าเริ่มต้น)
-  python scripts/color_path_detect.py --src recordings/data_1/video.mp4        # ดูสดไฟล์อื่น
-  python scripts/color_path_detect.py --src recordings/data_1/video.mp4 --no-live --out runs/cp --stride 5
-  python scripts/color_path_detect.py --src recordings/data_1/frames --no-live --out runs/cp --limit 80
-"""
 import argparse
 import csv
-import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -27,7 +13,7 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def yellow_mask(bgr, h_lo, h_hi, s_lo, v_lo):
-    """คืน mask ไบนารีของพิกเซลสีเหลือง (ทำความสะอาดด้วย morphology แล้ว)"""
+
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (h_lo, s_lo, v_lo), (h_hi, 255, 255))
     k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -39,8 +25,7 @@ def yellow_mask(bgr, h_lo, h_hi, s_lo, v_lo):
 
 
 def score_region(c, W, H, horizon_y):
-    """ให้คะแนน contour ว่า "เหมือน path บนพื้นแค่ไหน". คืน (ok, score, info)
-    ok=False = ถูกตัดทิ้ง (เก็บไว้วาดสีแดงเพื่อโชว์ว่าทำไมไม่เอา)"""
+  
     area = cv2.contourArea(c)
     x, y, w, h = cv2.boundingRect(c)
     M = cv2.moments(c)
@@ -75,7 +60,7 @@ def score_region(c, W, H, horizon_y):
 
 
 def centerline(mask_region, y0, y1, step=8):
-    """ไล่ทีละแถว หา x 'กลาง' (median กันค่าหลุด) ของพิกเซลเหลือง -> จุดกึ่งกลาง path"""
+
     pts = []
     for y in range(y0, y1, step):
         xs = np.where(mask_region[y] > 0)[0]
@@ -85,8 +70,7 @@ def centerline(mask_region, y0, y1, step=8):
 
 
 def fit_path(pts):
-    """ฟิตเส้นตรง x = m*y + b ผ่านจุด centerline (least-squares) เพื่อ 'เฉลี่ย' jitter ทิ้ง
-    คืน (m, b, y_top, y_bot) หรือ None ถ้าจุดน้อยเกินไป"""
+   
     if len(pts) < 3:
         return None
     arr = np.asarray(pts, float)
@@ -95,7 +79,7 @@ def fit_path(pts):
 
 
 def fit_points(fit, W, step=10):
-    """แปลงผลฟิตเป็นจุดเส้นกึ่งกลางเรียบ ๆ (สำหรับวาด) ภายในช่วง y ที่ตรวจเจอจริง"""
+
     if fit is None:
         return []
     m, b, yt, yb = fit
@@ -128,22 +112,31 @@ def draw_nav_arrows(img, pts, color, thickness=2, arrow=15, step=24):
         d += step
 
 
-def heading_from_fit(fit, roi_y, H, dead_deg=10):
-    """สรุปทิศจาก 'มุม' ของเส้นที่ฟิตเทียบกับเส้น ref กลาง (แนวตั้ง)
-    คืน (heading, angle_deg) โดย angle +ขวา / -ซ้าย; |angle|<dead_deg = STRAIGHT"""
-    if fit is None:
-        return "??", 0.0
-    m, _, yt, yb = fit
+def heading_from_offset(fit, box, W, H, roi_y, dead_off=0.03, sharp_off=0.30):
+    """สรุปทิศจาก 'offset แนวนอน' ของ "จุดปลายไกล" (blue line ตัดขอบบน detect box) เทียบกับ
+    "จุด ref คงที่" = กลางล่างของเฟรม (W/2, H) = ตำแหน่งที่เรายืน
+    offset = (x_top - W/2) / W : +ขวา / -ซ้าย  (ปลายไกลเยื้องขวาจากกลาง = path โค้งขวา)
+      |offset| < dead_off              = STRAIGHT
+      dead_off <= |offset| < sharp_off = BEAR LEFT/RIGHT (ทางโค้ง)
+      |offset| >= sharp_off            = SHARP LEFT/RIGHT (หักศอก)
+    คืน (heading, offset_norm, (x_top, y_top), (x_ref, y_ref))"""
+    p_ref = (W // 2, H - 1)                       # ref คงที่: กลางล่างของเฟรม
+    if fit is None or box is None:
+        return "??", 0.0, None, p_ref
+    m, b, _, _ = fit
+    bx, by, bw, bh = box
     look = H - roi_y
-    if (yb - yt) < 0.35 * look:                  # path สั้นเกินไปแนวตั้ง = ความชันมั่ว -> อย่าเชื่อ
-        return "STRAIGHT", 0.0
-    angle = float(np.degrees(np.arctan(-m)))     # มุมจากแนวตั้ง: +ขวา / -ซ้าย
-    angle = round(max(-89.0, min(89.0, angle)), 1)
-    if abs(angle) < dead_deg:
-        return "STRAIGHT", angle
-    if angle < 0:
-        return f"TURN LEFT {abs(angle):.0f}", angle
-    return f"TURN RIGHT {angle:.0f}", angle
+    if bh < 0.20 * look:                          # box เตี้ยเกินไป = ความชันมั่ว -> อย่าเชื่อ
+        return "STRAIGHT", 0.0, None, p_ref
+    y_top = by                                    # ขอบบน detect box (y น้อย = ไกล)
+    x_top = int(np.clip(m * y_top + b, 0, W - 1))
+    off = (x_top - W / 2) / W                     # signed: +ขวา / -ซ้าย
+    off = round(max(-1.0, min(1.0, off)), 3)
+    if abs(off) < dead_off:
+        return "STRAIGHT", off, (x_top, y_top), p_ref
+    side = "LEFT" if off < 0 else "RIGHT"
+    word = "SHARP" if abs(off) >= sharp_off else "BEAR"
+    return f"{word} {side} {abs(off)*100:.0f}%", off, (x_top, y_top), p_ref
 
 
 def process(bgr, args):
@@ -171,33 +164,38 @@ def process(bgr, args):
     ok_list.sort(key=lambda x: -x[1])
 
     # STOP detection — เจอเงื่อนไขใดเงื่อนไขหนึ่งให้แจ้ง "STOP - DECIDE":
-    #   (A) ทาง "strong" (ใหญ่+ถึงพื้น) ≥2 ทาง แยกข้างกัน ≥25% — Y-fork
-    #   (B) แถบยาวแนวนอน (w/h > 2.5, กว้าง > 30%) — ทางตัด/T-junction/แถบเตือนหยุด
+    #   (A1) Y-fork ซ้าย-ขวา: ≥2 ทางใหญ่พอ แยกซ้ายขวารวมกัน ≥20%W
+    #   (A2) 2 แยกฝั่งเดียวกัน: คู่ใด ๆ ทั้งคู่อยู่ฝั่งเดียวของกลางภาพ + ห่างกัน ≥10%W
+    #   (B)  แถบยาวแนวนอน (w/h > 2.0, กว้าง > 25%) — ทางตัด/แถบเตือนหยุด
     stop_contours = []
     strong = [(c, info) for c, _, info in ok_list
-              if info["area"] > 0.005 * H * W and info["reaches_bottom"]]
+              if info["area"] > 0.003 * H * W]            # ผ่อน: ไม่บังคับถึงพื้น (T-junction ก็เข้าได้)
     if len(strong) >= 2:
         cxs = sorted(info["cxy"][0] for _, info in strong[:3])
-        if cxs[-1] - cxs[0] > 0.25 * W:
+        cx_mid = W / 2
+        spread = cxs[-1] - cxs[0]                         # (A1) span ซ้ายสุด→ขวาสุด
+        same_side = any(                                  # (A2) มีคู่ที่อยู่ฝั่งเดียวกันและห่างกันพอ
+            ((a > cx_mid and b > cx_mid) or (a < cx_mid and b < cx_mid))
+            and (b - a) > 0.10 * W
+            for a, b in zip(cxs, cxs[1:])
+        )
+        if spread > 0.20 * W or same_side:
             stop_contours.extend(c for c, _ in strong[:3])
     for c in cnts:
         bx, by, bw, bh = cv2.boundingRect(c)
-        if (by >= roi_y and cv2.contourArea(c) > 0.004 * H * W
-                and bw > 0.30 * W and bw / max(bh, 1) > 2.5):
+        if (by >= roi_y and cv2.contourArea(c) > 0.003 * H * W
+                and bw > 0.25 * W and bw / max(bh, 1) > 2.0):
             stop_contours.append(c)
             break                                # หนึ่งแถบก็พอสำหรับกรณี (B)
     is_fork = len(stop_contours) > 0
 
     out = bgr.copy()
-    cv2.line(out, (cx_m - half_w, roi_y), (cx_m - half_w, H), (255, 0, 255), 2)  # ขอบซ้ายแถบกลาง
-    cv2.line(out, (cx_m + half_w, roi_y), (cx_m + half_w, H), (255, 0, 255), 2)  # ขอบขวาแถบกลาง
-    cv2.line(out, (cx_m - half_w, roi_y), (cx_m + half_w, roi_y), (255, 0, 255), 2)  # ขอบบน ROI
     if getattr(args, "show_rejected", False):
         for c in rejected:
             cv2.drawContours(out, [c], -1, (0, 0, 255), 2)
 
     region = np.zeros(mask.shape, np.uint8)
-    result = dict(found=False, heading="", reach=0.0, angle=0.0, fork=False)
+    result = dict(found=False, heading="", reach=0.0, offset=0.0, fork=False)
     fit, line_pts = None, []
 
     if is_fork:
@@ -232,12 +230,19 @@ def process(bgr, args):
             cv2.circle(out, p, 3, (255, 0, 0), -1)
         if len(pts) >= 2:
             cv2.polylines(out, [np.array(pts)], False, (255, 0, 0), 2)
-        heading, angle = heading_from_fit(fit, roi_y, H)
+        heading, off_norm, p_far, p_ref = heading_from_offset(
+            fit, info["box"], W, H, roi_y,
+            dead_off=args.dead_off,
+            sharp_off=getattr(args, "sharp_off", 0.30))
+        cv2.drawMarker(out, p_ref, (0, 255, 255), cv2.MARKER_CROSS, 18, 2)   # ref คงที่ (เหลือง): กลางล่างเฟรม
+        if p_far is not None:                        # จุดปลายไกล (ฟ้าสว่าง) + เส้นวัด offset
+            cv2.line(out, p_ref, p_far, (255, 255, 0), 1, cv2.LINE_AA)
+            cv2.circle(out, p_far, 7, (255, 255, 0), -1)
 
         top_y = fit[2] if fit is not None else y
         reach = (H - top_y) / H * 100.0
-        result.update(found=True, heading=heading, reach=round(reach, 1), angle=angle)
-        cv2.putText(out, f"PATH  {heading}  ({angle:+.0f} deg)  reach~{reach:.0f}%",
+        result.update(found=True, heading=heading, reach=round(reach, 1), offset=off_norm)
+        cv2.putText(out, f"PATH  {heading}  (off={off_norm:+.2f})  reach~{reach:.0f}%",
                     (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 180, 0), 2)
     else:
         cv2.putText(out, "NO PATH", (12, 34),
@@ -247,7 +252,6 @@ def process(bgr, args):
     mask_vis = np.zeros((H, W, 3), np.uint8)
     mask_vis[mask > 0] = (0, 120, 120)             # เหลืองดิบที่เจอ (จาง)
     mask_vis[region > 0] = (0, 255, 255)           # detection: ทางที่ตรวจเจอ (เหลืองสด)
-    cv2.line(mask_vis, (0, roi_y), (W, roi_y), (255, 0, 255), 2)          # ขอบ ROI
     cx_ref = W // 2
     cv2.line(mask_vis, (cx_ref, roi_y), (cx_ref, H), (255, 255, 255), 1)  # navigation: เส้น ref กลาง
     if result.get("fork"):
@@ -258,7 +262,7 @@ def process(bgr, args):
         near = line_pts[-1]                        # จุดใกล้เท้า (y มากสุด)
         draw_nav_arrows(mask_vis, line_pts, (0, 165, 255), 3)
         off = (near[0] - cx_ref) / (W / 2)         # ทางเยื้องซ้าย/ขวาจากกลาง (-ซ้าย/+ขวา)
-        nav = f"{result['heading']}  ({result['angle']:+.0f} deg)  off={off:+.2f}"
+        nav = f"{result['heading']}  box-off={result['offset']:+.2f}  lat={off:+.2f}"
         cv2.putText(mask_vis, nav, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
     else:
         cv2.putText(mask_vis, "NO PATH", (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
@@ -268,7 +272,7 @@ def process(bgr, args):
 def write_summary(out, rows):
     with open(out / "summary.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["frame", "path_found", "heading", "reach_pct", "angle_deg", "fork"])
+        w.writerow(["frame", "path_found", "heading", "reach_pct", "offset", "fork"])
         w.writerows(rows)
 
 
@@ -291,7 +295,7 @@ def run_images(src, out, args):
         view, mask_vis, r = process(img, args)
         cv2.imwrite(str(out / p.name), view)
         cv2.imwrite(str(out / "mask" / p.name), mask_vis)
-        rows.append([p.name, r["found"], r["heading"], r["reach"], r["angle"], r["fork"]])
+        rows.append([p.name, r["found"], r["heading"], r["reach"], r["offset"], r["fork"]])
         n_found += int(r["found"])
     write_summary(out, rows)
     print(f"ประมวลผล {len(rows)} เฟรม | เจอ path {n_found} ({100*n_found/max(len(rows),1):.0f}%)")
@@ -324,7 +328,7 @@ def run_video(src, out, args):
             h, w = view.shape[:2]
             writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
         writer.write(view)
-        rows.append([idx, r["found"], r["heading"], r["reach"], r["angle"], r["fork"]])
+        rows.append([idx, r["found"], r["heading"], r["reach"], r["offset"], r["fork"]])
         n_found += int(r["found"])
         written += 1
         if written % 200 == 0:
@@ -343,7 +347,7 @@ def run_video(src, out, args):
 def run_live(src, args):
     """โหมดดูสด: เล่นวิดีโอ + overlay ผลตรวจจับแบบเรียลไทม์ (หน้าต่างเดียว)
     ปุ่ม:  q=ออก | space=หยุด/เล่น | a,d=ถอย/เดินหน้าทีละเฟรม (ตอนหยุด)
-    Alert: throttle เหมือน blind_navigation — แจ้งเฉพาะเลี้ยว/STOP ทุก ๆ alert_interval วินาที"""
+    Alert: debounce + throttle เหมือน blind_navigation — แจ้งเฉพาะเลี้ยว/STOP เมื่อคงที่ครบเวลา"""
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         raise SystemExit(f"เปิดวิดีโอไม่ได้: {src}")
@@ -351,36 +355,84 @@ def run_live(src, args):
     win_v = "view  q=quit  space=pause  a/d=step"
     cv2.namedWindow(win_v, cv2.WINDOW_NORMAL)
 
-    # alert gate (rate-limit) — แบบเดียวกับ CALL_INTERVAL ใน blind_navigation
-    interval = getattr(args, "alert_interval", 3.0)
-    banner_dur = 1.8
-    last_alert_t, last_alert_lbl = 0.0, ""
-    banner_until, banner_text, banner_col = 0.0, "", (0, 0, 255)
+    # FIFO delay line: เก็บ label ไว้ alert_buf เฟรมแล้วค่อย "ปล่อย" ออก HUD
+    # (มุมกล้องนำหน้าคนเดิน → ดีเลย์ label ให้ตรงกับตำแหน่งจริงตอนเดินถึง)
+    # + EMA smoothing บน offset scalar (ไม่กระทบ region/blue line); alpha=1.0=ปิด, ต่ำ=นิ่งกว่า
+    buf_frames = max(1, int(getattr(args, "alert_buf", 10)))
+    off_alpha = getattr(args, "offset_smooth", 0.3)
+    label_q = deque()
+    hud_label = "STRAIGHT"
+    smooth_o = None
+
+    # auto-pause เมื่อ HUD label เพิ่งกลายเป็น "STOP - DECIDE" — ค้างคลิป N เฟรม (= sec * fps)
+    # + cooldown: หลัง auto-pause ปลด ห้าม trigger ซ้ำในอีก stop_cooldown_sec วินาที
+    stop_pause_sec = float(getattr(args, "stop_pause_sec", 0.0))
+    stop_pause_frames = int(round(stop_pause_sec * args.fps)) if stop_pause_sec > 0 else 0
+    stop_cooldown_frames = int(round(float(getattr(args, "stop_cooldown_sec", 10.0)) * args.fps))
+    auto_pause_left = 0
+    cooldown_left = 0
+    prev_hud = hud_label
 
     paused, frame = False, None
     while True:
-        if not paused:
+        advance = (not paused) and (auto_pause_left <= 0)
+        if advance:
             ok, frame = cap.read()
             if not ok:                                  # จบวิดีโอ -> วนซ้ำ
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
         view, _, r = process(frame, args)
 
-        # --- alert gate: ใช้เฉพาะเลี้ยว/STOP, throttle เวลา + เปลี่ยน label ก็ปล่อยทันที ---
-        lbl = r["heading"]
-        now = time.time()
-        actionable = lbl.startswith("TURN ") or lbl.startswith("STOP")
-        if actionable and (lbl != last_alert_lbl or now - last_alert_t >= interval):
-            print(f"[ALERT {time.strftime('%H:%M:%S')}] {lbl}")
-            last_alert_t, last_alert_lbl = now, lbl
-            banner_until = now + banner_dur
-            banner_text = lbl
-            banner_col = (0, 140, 255) if lbl.startswith("STOP") else (0, 0, 255)
-        if now < banner_until:
-            h2, w2 = view.shape[:2]
-            cv2.rectangle(view, (0, h2 - 80), (w2, h2 - 20), (0, 0, 0), -1)
-            cv2.putText(view, "ALERT: " + banner_text, (20, h2 - 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.3, banner_col, 3)
+        # --- EMA smooth offset scalar -> recompute heading label จาก offset ที่นิ่งแล้ว ---
+        if r.get("fork"):
+            cur = "STOP - DECIDE"
+            smooth_o = None
+        elif r["found"]:
+            raw_o = r["offset"]
+            smooth_o = raw_o if smooth_o is None else off_alpha * raw_o + (1 - off_alpha) * smooth_o
+            abs_o = abs(smooth_o)
+            if abs_o < args.dead_off:
+                cur = "STRAIGHT"
+            else:
+                side = "LEFT" if smooth_o < 0 else "RIGHT"
+                word = "SHARP" if abs_o >= args.sharp_off else "BEAR"
+                cur = f"{word} {side} {abs_o*100:.0f}%"
+        else:
+            smooth_o = None
+            cur = r["heading"] or "??"
+
+        # --- FIFO delay line: ป้อน cur เข้าคิว, ปล่อยตัวที่อยู่ในคิวมาแล้ว buf_frames เฟรมออก HUD ---
+        # หยุดป้อนคิวระหว่าง auto-pause (จะได้ไม่กิน buffer ทิ้งระหว่างค้างจอ)
+        if advance:
+            label_q.append(cur)
+            if len(label_q) > buf_frames:
+                hud_label = label_q.popleft()    # ตัวนี้คือ label จาก buf_frames เฟรมที่แล้ว
+
+        # ตรวจ "เพิ่งเข้า STOP" เพื่อ trigger auto-pause (เฉพาะตอนที่ HUD เลื่อนคิวจริง ๆ
+        # และพ้น cooldown แล้ว — กันค้างซ้ำต่อเนื่อง)
+        if (stop_pause_frames > 0 and advance and cooldown_left <= 0
+                and hud_label.startswith("STOP") and not prev_hud.startswith("STOP")):
+            auto_pause_left = stop_pause_frames
+            cooldown_left = stop_pause_frames + stop_cooldown_frames    # cooldown เริ่มหลัง pause จบ
+        if auto_pause_left > 0:
+            auto_pause_left -= 1
+        if cooldown_left > 0:
+            cooldown_left -= 1
+        prev_hud = hud_label
+
+        col = ((0, 140, 255) if hud_label.startswith("STOP") else
+               (0, 0, 255) if hud_label.startswith("SHARP") else
+               (0, 165, 255) if hud_label.startswith("BEAR") else
+               (0, 180, 0) if hud_label == "STRAIGHT" else
+               (160, 160, 160))
+        cv2.rectangle(view, (0, 0), (760, 55), (0, 0, 0), -1)             # ทับ text เดิมของ process
+        # ไม่โชว์ "(deg)" แยกแล้ว — มุมอยู่ในตัว label เอง ("BEAR LEFT 8") กันคนละจังหวะ debounce
+        if auto_pause_left > 0:
+            secs_left = auto_pause_left / max(args.fps, 1)
+            txt = f"{hud_label}   [HOLD {secs_left:.1f}s]"
+        else:
+            txt = f"{hud_label}   reach~{r['reach']:.0f}%" if r["found"] else hud_label
+        cv2.putText(view, txt, (12, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.95, col, 2)
 
         cv2.imshow(win_v, view)
         key = cv2.waitKey(0 if paused else delay) & 0xFF
@@ -408,8 +460,18 @@ def main():
     ap.add_argument("--live", action=argparse.BooleanOptionalAction, default=True,
                     help="ดูสด 2 หน้าต่าง (ค่าเริ่มต้น); ใช้ --no-live เพื่อ export เป็นไฟล์แทน")
     ap.add_argument("--fps", type=int, default=30, help="[โหมด --live] ความเร็วเล่น")
-    ap.add_argument("--alert-interval", type=float, default=3.0,
-                    help="[โหมด --live] วินาทีขั้นต่ำระหว่างแจ้งเตือนซ้ำ (แบบ CALL_INTERVAL ของ blind_navigation)")
+    ap.add_argument("--offset-smooth", type=float, default=0.3,
+                    help="[โหมด --live] EMA alpha smooth offset (1.0=ปิด/ดิบ, ต่ำ=นิ่งกว่า; smooth เฉพาะเลขไม่กระทบ region)")
+    ap.add_argument("--alert-buf", type=int, default=40,
+                    help="[โหมด --live] FIFO delay line: ดีเลย์การปล่อย label HUD กี่เฟรม (ชดเชยกล้องนำหน้าคนเดิน; 45 ≈ 1.5s ที่ 30 fps)")
+    ap.add_argument("--stop-pause-sec", type=float, default=5.0,
+                    help="[โหมด --live] auto-pause คลิปกี่วินาทีตอน HUD เพิ่งเข้า 'STOP - DECIDE' (0 = ปิดโหมดนี้)")
+    ap.add_argument("--stop-cooldown-sec", type=float, default=10.0,
+                    help="[โหมด --live] หลัง auto-pause จบ ห้าม trigger ซ้ำกี่วินาที (กันค้างจอเป็นชุด)")
+    ap.add_argument("--sharp-off", type=float, default=0.30,
+                    help="offset ขั้นต่ำ (เศษส่วนของ W) ที่ถือว่าเป็น 'SHARP' (หักศอก); ต่ำกว่านี้แต่ ≥ dead-off = 'BEAR' (โค้ง)")
+    ap.add_argument("--dead-off", type=float, default=0.1,
+                    help="ขั้นต่ำ |offset| (เศษส่วนของ W) ถึงจะถือว่าเลี้ยวซ้าย/ขวา (ต่ำกว่านี้ถือว่า STRAIGHT)")
     ap.add_argument("--limit", type=int, default=0, help="จำกัดจำนวนเฟรม (0=ทั้งหมด)")
     ap.add_argument("--only", default="", help="[โหมดรูป] ประมวลผลไฟล์เดียว (ชื่อไฟล์)")
     ap.add_argument("--stride", type=int, default=1, help="[โหมดวิดีโอ] ประมวลผลทุก ๆ N เฟรม (มาก=เร็ว)")
@@ -417,11 +479,11 @@ def main():
     # --- ช่วงสีเหลือง (OpenCV H 0-179) ---
     ap.add_argument("--h_lo", type=int, default=5)
     ap.add_argument("--h_hi", type=int, default=20, help="ต่ำกว่า ~35 = กันใบไม้เขียว; ทางลากถึง H~38 (จูนแล้ว)")
-    ap.add_argument("--s_lo", type=int, default=30, help="ต่ำ=จับทางซีดได้เยอะ (ROI แคบกัน noise นอกกรอบให้แล้ว); จูนสุด: 15")
-    ap.add_argument("--v_lo", type=int, default=95, help="ต่ำ=จับทางในเงาได้; แทบไม่มีผลตอน ROI แคบ; จูนสุด: 60")
-    ap.add_argument("--horizon", type=float, default=0.30, help="ส่วนบนของภาพที่ถือว่า 'ไม่ใช่พื้น'")
+    ap.add_argument("--s_lo", type=int, default=25, help="ต่ำ=จับทางซีดได้เยอะ (ROI แคบกัน noise นอกกรอบให้แล้ว); จูนสุด: 15")
+    ap.add_argument("--v_lo", type=int, default=85, help="ต่ำ=จับทางในเงาได้; แทบไม่มีผลตอน ROI แคบ; จูนสุด: 60")
+    ap.add_argument("--horizon", type=float, default=0.20, help="ส่วนบนของภาพที่ถือว่า 'ไม่ใช่พื้น'")
     ap.add_argument("--bottom", type=float, default=0.3, help="ตรวจเฉพาะแถบล่าง N ของภาพ (0.50=ล่าง 50%%)")
-    ap.add_argument("--center", type=float, default=0.40,
+    ap.add_argument("--center", type=float, default=0.3,
                     help="ตรวจเฉพาะแถบกลาง N ของความกว้าง (0.40=กว้าง 40%% รอบกลาง = ±20%%)")
     args = ap.parse_args()
     args.stride = max(1, args.stride)
